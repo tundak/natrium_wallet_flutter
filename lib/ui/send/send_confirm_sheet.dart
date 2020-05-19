@@ -1,21 +1,29 @@
 import 'dart:async';
 
 import 'package:auto_size_text/auto_size_text.dart';
-import 'package:flutter/material.dart';
 import 'package:event_taxi/event_taxi.dart';
+import 'package:flutter/material.dart';
 import 'package:manta_dart/manta_wallet.dart';
 import 'package:manta_dart/messages.dart';
 import 'package:natrium_wallet_flutter/app_icons.dart';
 
 import 'package:natrium_wallet_flutter/appstate_container.dart';
+import 'package:natrium_wallet_flutter/bus/events.dart';
 import 'package:natrium_wallet_flutter/dimens.dart';
+import 'package:natrium_wallet_flutter/model/db/appdb.dart';
+import 'package:natrium_wallet_flutter/model/db/contact.dart';
+import 'package:natrium_wallet_flutter/network/account_service.dart';
+import 'package:natrium_wallet_flutter/network/model/response/process_response.dart';
 import 'package:natrium_wallet_flutter/styles.dart';
 import 'package:natrium_wallet_flutter/localization.dart';
 import 'package:natrium_wallet_flutter/service_locator.dart';
-import 'package:natrium_wallet_flutter/bus/events.dart';
+import 'package:natrium_wallet_flutter/ui/send/send_complete_sheet.dart';
+import 'package:natrium_wallet_flutter/ui/util/routes.dart';
 import 'package:natrium_wallet_flutter/ui/widgets/buttons.dart';
 import 'package:natrium_wallet_flutter/ui/widgets/dialog.dart';
 import 'package:natrium_wallet_flutter/ui/util/ui_util.dart';
+import 'package:natrium_wallet_flutter/ui/widgets/sheet_util.dart';
+import 'package:natrium_wallet_flutter/util/nanoutil.dart';
 import 'package:natrium_wallet_flutter/util/numberutil.dart';
 import 'package:natrium_wallet_flutter/util/sharedprefsutil.dart';
 import 'package:natrium_wallet_flutter/util/biometrics.dart';
@@ -54,6 +62,24 @@ class _SendConfirmSheetState extends State<SendConfirmSheet> {
   bool sent;
   bool isMantaTransaction;
 
+  StreamSubscription<AuthenticatedEvent> _authSub;
+
+  void _registerBus() {
+    _authSub = EventTaxiImpl.singleton()
+        .registerTo<AuthenticatedEvent>()
+        .listen((event) {
+      if (event.authType == AUTH_EVENT_TYPE.SEND) {
+        _doSend();
+      }
+    });
+  }
+
+  void _destroyBus() {
+    if (_authSub != null) {
+      _authSub.cancel();
+    }
+  }
+
   @override
   void initState() {
     super.initState();
@@ -80,39 +106,6 @@ class _SendConfirmSheetState extends State<SendConfirmSheet> {
   void dispose() {
     _destroyBus();
     super.dispose();
-  }
-
-  // Event bus
-  StreamSubscription<SendFailedEvent> _sendEventFailedSub;
-  StreamSubscription<ProcessEvent> _processEventSub;
-
-  void _registerBus() {
-    _sendEventFailedSub =
-        EventTaxiImpl.singleton().registerTo<SendFailedEvent>().listen((event) {
-      // Send failed
-      if (animationOpen) {
-        Navigator.of(context).pop();
-      }
-      UIUtil.showSnackbar(AppLocalization.of(context).sendError, context);
-      Navigator.of(context).pop();
-    });
-    _processEventSub =
-        EventTaxiImpl.singleton().registerTo<ProcessEvent>().listen((event) {
-      if (!sent && widget.manta != null) {
-        widget.manta.sendPayment(
-            transactionHash: event.response.hash, cryptoCurrency: "NANO");
-      }
-      sent = true;
-    });
-  }
-
-  void _destroyBus() {
-    if (_sendEventFailedSub != null) {
-      _sendEventFailedSub.cancel();
-    }
-    if (_processEventSub != null) {
-      _processEventSub.cancel();
-    }
   }
 
   void _showSendingAnimation(BuildContext context) {
@@ -341,16 +334,8 @@ class _SendConfirmSheetState extends State<SendConfirmSheet> {
                                                           .replaceAll("%1", amount));
                                 if (authenticated) {
                                   sl.get<HapticUtil>().fingerprintSucess();
-                                  _showSendingAnimation(context);
-                                  StateContainer.of(context).requestSend(
-                                      StateContainer.of(context)
-                                          .wallet
-                                          .frontier,
-                                      destinationAltered,
-                                      widget.maxSend ? "0" : widget.amountRaw,
-                                      localCurrencyAmount:
-                                          widget.localCurrency,
-                                      paymentRequest: widget.paymentRequest);
+                                  EventTaxiImpl.singleton()
+                                            .fire(AuthenticatedEvent(AUTH_EVENT_TYPE.SEND));   
                                 }
                               } catch (e) {
                                 await authenticateWithPin();
@@ -383,32 +368,62 @@ class _SendConfirmSheetState extends State<SendConfirmSheet> {
         ));
   }
 
+  Future<void> _doSend() async {
+    try {
+      _showSendingAnimation(context);
+      ProcessResponse resp = await sl.get<AccountService>().requestSend(
+        StateContainer.of(context).wallet.representative,
+        StateContainer.of(context).wallet.frontier,
+        widget.amountRaw,
+        destinationAltered,
+        StateContainer.of(context).wallet.address,
+        NanoUtil.seedToPrivate(await StateContainer.of(context).getSeed(), StateContainer.of(context).selectedAccount.index),
+        max: widget.maxSend
+      );
+      StateContainer.of(context).wallet.frontier = resp.hash;
+      StateContainer.of(context).wallet.accountBalance += BigInt.parse(widget.amountRaw);
+      // Show complete
+      Contact contact = await sl.get<DBHelper>().getContactWithAddress(widget.destination);
+      String contactName = contact == null ? null : contact.name;
+      Navigator.of(context).popUntil(RouteUtils.withNameLike('/home'));
+      StateContainer.of(context).requestUpdate();
+      Sheets.showAppHeightNineSheet(
+          context: context,
+          closeOnTap: true,
+          removeUntilHome: true,
+          widget: SendCompleteSheet(
+              amountRaw: widget.amountRaw,
+              destination: destinationAltered,
+              contactName: contactName,
+              localAmount: widget.localCurrency,
+              paymentRequest: widget.paymentRequest));
+    } catch (e) {
+      // Send failed
+      if (animationOpen) {
+        Navigator.of(context).pop();
+      }
+      UIUtil.showSnackbar(AppLocalization.of(context).sendError, context);
+      Navigator.of(context).pop();
+    }
+  }
+
   Future<void> authenticateWithPin() async {
     // PIN Authentication
-    sl.get<Vault>().getPin().then((expectedPin) {
-      Navigator.of(context).push(MaterialPageRoute(
+    String expectedPin = await sl.get<Vault>().getPin();
+    bool auth = await Navigator.of(context).push(MaterialPageRoute(
           builder: (BuildContext context) {
         return new PinScreen(
           PinOverlayType.ENTER_PIN,
-          (pin) {
-            Navigator.of(context).pop();
-            _showSendingAnimation(context);
-            StateContainer.of(context).requestSend(
-                StateContainer.of(context)
-                    .wallet
-                    .frontier,
-                destinationAltered,
-                widget.maxSend ? "0" : widget.amountRaw,
-                localCurrencyAmount:
-                    widget.localCurrency,
-                paymentRequest: widget.paymentRequest);
-          },
           expectedPin: expectedPin,
           description: AppLocalization.of(context)
               .sendAmountConfirmPin
               .replaceAll("%1", amount),
         );
       }));
-    });
+    if (auth != null && auth) {
+      await Future.delayed(Duration(milliseconds: 200));
+       EventTaxiImpl.singleton()
+          .fire(AuthenticatedEvent(AUTH_EVENT_TYPE.SEND));    
+    }
   }
 }

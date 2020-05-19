@@ -154,15 +154,19 @@ class _SettingsSheetState extends State<SettingsSheet>
 
   StreamSubscription<TransferConfirmEvent> _transferConfirmSub;
   StreamSubscription<TransferCompleteEvent> _transferCompleteSub;
-  StreamSubscription<UnlockCallbackEvent> _callbackUnlockSub;
 
   void _registerBus() {
     // Ready to go to transfer confirm
     _transferConfirmSub = EventTaxiImpl.singleton()
         .registerTo<TransferConfirmEvent>()
         .listen((event) {
-      AppTransferConfirmSheet(event.balMap, transferError)
-          .mainBottomSheet(context);
+      Sheets.showAppHeightNineSheet(
+        context: context,
+        widget: AppTransferConfirmSheet(
+          privKeyBalanceMap: event.balMap,
+          errorCallback: transferError,
+        )
+      );          
     });
     // Ready to go to transfer complete
     _transferCompleteSub = EventTaxiImpl.singleton()
@@ -173,12 +177,6 @@ class _SettingsSheetState extends State<SettingsSheet>
               NumberUtil.getRawAsUsableString(event.amount.toString()))
           .mainBottomSheet(context);
     });
-    // Unlock callback
-    _callbackUnlockSub = EventTaxiImpl.singleton()
-        .registerTo<UnlockCallbackEvent>()
-        .listen((event) {
-      StateContainer.of(context).unlockCallback();
-    });
   }
 
   void _destroyBus() {
@@ -187,9 +185,6 @@ class _SettingsSheetState extends State<SettingsSheet>
     }
     if (_transferCompleteSub != null) {
       _transferCompleteSub.cancel();
-    }
-    if (_callbackUnlockSub != null) {
-      _callbackUnlockSub.cancel();
     }
   }
 
@@ -972,10 +967,12 @@ class _SettingsSheetState extends State<SettingsSheet>
                           // Main account address
                           Container(
                             child: Text(
-                              StateContainer.of(context)
-                                  .wallet
-                                  ?.address
-                                  ?.substring(0, 12),
+                              StateContainer.of(context).wallet != null && StateContainer.of(context).wallet.address != null ?
+                                StateContainer.of(context)
+                                    .wallet
+                                    ?.address
+                                    ?.substring(0, 12)
+                                : "",
                               style: TextStyle(
                                 fontFamily: "OverpassMono",
                                 fontWeight: FontWeight.w100,
@@ -1475,25 +1472,25 @@ class _SettingsSheetState extends State<SettingsSheet>
 
   Future<void> authenticateWithPin() async {
     // PIN Authentication
-    sl.get<Vault>().getPin().then((expectedPin) {
-      Navigator.of(context).push(MaterialPageRoute(
+    String expectedPin = await sl.get<Vault>().getPin();
+    bool auth = await Navigator.of(context).push(MaterialPageRoute(
           builder: (BuildContext context) {
         return new PinScreen(
           PinOverlayType.ENTER_PIN,
-          (pin) {
-            Navigator.of(context).pop();
-            StateContainer.of(context)
-                .getSeed()
-                .then((seed) {
-              AppSeedBackupSheet(seed)
-                  .mainBottomSheet(context);
-            });
-          },
           expectedPin: expectedPin,
           description:
               AppLocalization.of(context).pinSeedBackup,
         );
       }));
-    });    
+    if (auth != null && auth) {
+      await Future.delayed(Duration(milliseconds: 200));
+            Navigator.of(context).pop();
+      StateContainer.of(context)
+          .getSeed()
+          .then((seed) {
+        AppSeedBackupSheet(seed)
+            .mainBottomSheet(context);
+      });
+    }   
   }
 }

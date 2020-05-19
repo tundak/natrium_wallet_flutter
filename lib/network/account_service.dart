@@ -3,13 +3,20 @@ import 'dart:collection';
 import 'dart:convert';
 
 import 'package:flutter/foundation.dart';
+import 'package:natrium_wallet_flutter/util/sharedprefsutil.dart';
 import 'package:logger/logger.dart';
+import 'package:natrium_wallet_flutter/model/wallet.dart';
+import 'package:natrium_wallet_flutter/network/model/block_types.dart';
+import 'package:natrium_wallet_flutter/network/model/request/account_info_request.dart';
+import 'package:natrium_wallet_flutter/network/model/request/block_info_request.dart';
+import 'package:natrium_wallet_flutter/network/model/response/account_info_response.dart';
 import 'package:natrium_wallet_flutter/service_locator.dart';
 
 import 'package:web_socket_channel/io.dart';
 import 'package:package_info/package_info.dart';
 import 'package:event_taxi/event_taxi.dart';
 import 'package:synchronized/synchronized.dart';
+import 'package:http/http.dart' as http;
 
 import 'package:natrium_wallet_flutter/model/state_block.dart';
 import 'package:natrium_wallet_flutter/network/model/base_request.dart';
@@ -33,6 +40,7 @@ import 'package:natrium_wallet_flutter/bus/events.dart';
 
 // Server Connection String
 const String _SERVER_ADDRESS = "wss://app.natrium.io";
+const String _SERVER_ADDRESS_HTTP = "https://app.natrium.io/api";
 
 Map decodeJson(dynamic src) {
   return json.decode(src);
@@ -185,7 +193,7 @@ class AccountService {
     await _lock.synchronized(() async {
       _isConnected = true;
       _isConnecting = false;
-      log.d("Received $message");
+      //log.d("Received $message");
       Map msg = await compute(decodeJson, message);
       // Determine response type
       if (msg.containsKey("uuid") || (msg.containsKey("frontier") && msg.containsKey("representative_block")) ||
@@ -198,53 +206,12 @@ class AccountService {
         // Price info sent from server
         PriceResponse resp = PriceResponse.fromJson(msg);
         EventTaxiImpl.singleton().fire(PriceEvent(response: resp));
-      } else if (msg.containsKey("history")) {
-        // Account history response
-        if (msg['history'] == "") {
-          msg['history'] = new List<AccountHistoryResponseItem>();
-        }
-        AccountHistoryResponse resp = await compute(accountHistoryresponseFromJson, msg);
-        EventTaxiImpl.singleton().fire(HistoryEvent(response: resp));
-      } else if (msg.containsKey("blocks")) {
-        // This is a 'pending' response
-        if (msg['blocks'] is Map && msg['blocks'].length > 0) {
-          Map<String, dynamic> blockMap = msg['blocks'];
-          if (blockMap != null && blockMap.length > 0) {
-            PendingResponse resp = await compute(pendingResponseFromJson, msg);
-            EventTaxiImpl.singleton().fire(PendingEvent(response: resp));
-          }
-        } else {
-          // Possibly a response when there is no pendings
-          pop();
-          processQueue();
-        }
-      } else if (msg.containsKey("block_account") && msg.containsKey("contents") && msg.containsKey("amount") && msg.containsKey("balance")) {
-        // Block Info Response
-        BlockInfoItem resp = await compute(blockInfoItemFromJson, msg);
-        EventTaxiImpl.singleton().fire(BlocksInfoEvent(response: resp));
       } else if (msg.containsKey("block") && msg.containsKey("hash") && msg.containsKey("account")) {
         CallbackResponse resp = await compute(callbackResponseFromJson, msg);
         EventTaxiImpl.singleton().fire(CallbackEvent(response: resp));
-      } else if (msg.containsKey("hash")) {
-        // process response
-        ProcessResponse resp = ProcessResponse.fromJson(msg);
-        EventTaxiImpl.singleton().fire(ProcessEvent(response: resp));
       } else if (msg.containsKey("error")) {
         ErrorResponse resp = ErrorResponse.fromJson(msg);
         EventTaxiImpl.singleton().fire(ErrorEvent(response: resp));
-      } else if (msg.containsKey("balances")) {
-        // accounts_balances response
-        if (msg['balances'] is Map && msg['balances'].length > 0) {
-          Map<String, dynamic> balancesMap = msg['balances'];
-          if (balancesMap != null && balancesMap.length > 0) {
-            if (balancesMap[balancesMap.keys.first].containsKey('pending')) {
-              RequestItem<dynamic> lastRequest = pop();
-              AccountsBalancesResponse resp = await compute(accountsBalancesResponseFromJson, msg);
-              EventTaxiImpl.singleton().fire(AccountsBalancesEvent(response: resp, transfer: lastRequest.fromTransfer));
-              processQueue();
-            }
-          }
-        }
       }
       return;
     });
@@ -253,20 +220,20 @@ class AccountService {
   /* Send Request */
   Future<void> sendRequest(BaseRequest request) async {
     // We don't care about order or server response in these requests
-    log.d("sending ${json.encode(request.toJson())}");
+    //log.d("sending ${json.encode(request.toJson())}");
     _send(await compute(encodeRequestItem, request));
   }
 
   /* Enqueue Request */
   void queueRequest(BaseRequest request, {bool fromTransfer = false}) {
-    log.d("requetest ${json.encode(request.toJson())}, q length: ${_requestQueue.length}");
+    //log.d("requetest ${json.encode(request.toJson())}, q length: ${_requestQueue.length}");
     _requestQueue.add(new RequestItem(request, fromTransfer: fromTransfer));
   }
 
   /* Process Queue */
   Future<void> processQueue() async {
     await _lock.synchronized(() async {
-      log.d("Request Queue length ${_requestQueue.length}");
+      //log.d("Request Queue length ${_requestQueue.length}");
       if (_requestQueue != null && _requestQueue.length > 0) {
         RequestItem requestItem = _requestQueue.first;
         if (requestItem != null && !requestItem.isProcessing) {
@@ -278,7 +245,7 @@ class AccountService {
           }
           requestItem.isProcessing = true;
           String requestJson = await compute(encodeRequestItem, requestItem.request);
-          log.d("Sending: $requestJson");
+          //log.d("Sending: $requestJson");
           await _send(requestJson);
         } else if (requestItem != null && (DateTime
             .now()
@@ -364,4 +331,217 @@ class AccountService {
   }
 
   Queue<RequestItem> get requestQueue => _requestQueue;
+
+  // HTTP API
+
+  Future<dynamic> makeHttpRequest(BaseRequest request) async {
+    http.Response response = await http.post(
+      _SERVER_ADDRESS_HTTP,
+      headers:  {
+        'Content-type': 'application/json'
+      },
+      body: json.encode(request.toJson())
+    );
+    if (response.statusCode != 200) {
+      return null;
+    }
+    Map decoded = json.decode(response.body);
+    if (decoded.containsKey("error")) {
+      return ErrorResponse.fromJson(decoded);
+    }
+    return decoded;
+  }
+
+  Future<AccountInfoResponse> getAccountInfo(String account) async {
+    AccountInfoRequest request = AccountInfoRequest(
+      account: account
+    );
+    dynamic response = await makeHttpRequest(request);
+    if (response is ErrorResponse) {
+      if (response.error == "Account not found") {
+        return AccountInfoResponse(unopened: true);
+      }
+      throw Exception("Received error ${response.error}");
+    }
+    AccountInfoResponse infoResponse = AccountInfoResponse.fromJson(response); 
+    return infoResponse;
+  }
+
+  Future<PendingResponse> getPending(String account, int count, {String threshold, bool includeActive = false}) async {
+    threshold = threshold ?? BigInt.from(10).pow(24).toString();
+    PendingRequest request = PendingRequest(
+      account: account,
+      count: count,
+      threshold: threshold,
+      includeActive: includeActive
+    );
+    dynamic response = await makeHttpRequest(request);
+    if (response is ErrorResponse) {
+      throw Exception("Received error ${response.error}");
+    }
+    PendingResponse pr;
+    if (response["blocks"] == "") {
+      pr = PendingResponse(
+        blocks: {}
+      );
+    } else {
+      pr = PendingResponse.fromJson(response); 
+    }
+    return pr;
+  }
+
+  Future<BlockInfoItem> requestBlockInfo(String hash) async {
+    BlockInfoRequest request = BlockInfoRequest(
+      hash: hash
+    );
+    dynamic response = await makeHttpRequest(request);
+    if (response is ErrorResponse) {
+      throw Exception("Received error ${response.error}");
+    }
+    BlockInfoItem item = BlockInfoItem.fromJson(response);
+    return item;
+  }
+
+  Future<AccountHistoryResponse> requestAccountHistory(String account, { int count = 1}) async {
+    AccountHistoryRequest request = AccountHistoryRequest(
+      account: account,
+      count: count
+    );
+    dynamic response = await makeHttpRequest(request);
+    if (response is ErrorResponse) {
+      throw Exception("Received error ${response.error}");
+    }
+    if (response["history"] == "") {
+      response["history"] = [];
+    }    
+    return AccountHistoryResponse.fromJson(response);
+  }
+
+  Future<AccountsBalancesResponse> requestAccountsBalances(List<String> accounts) async {
+    AccountsBalancesRequest request = AccountsBalancesRequest(
+      accounts: accounts
+    );
+    dynamic response = await makeHttpRequest(request);
+    if (response is ErrorResponse) {
+      throw Exception("Received error ${response.error}");
+    }
+    return AccountsBalancesResponse.fromJson(response);
+  }
+
+  Future<ProcessResponse> requestProcess(ProcessRequest request) async {
+    dynamic response = await makeHttpRequest(request);
+    if (response is ErrorResponse) {
+      throw Exception("Received error ${response.error}");
+    }
+    ProcessResponse item = ProcessResponse.fromJson(response);
+    return item;
+  }
+
+  Future<ProcessResponse> requestReceive(String representative, String previous, String balance, String link, String account, String privKey) async {
+    StateBlock receiveBlock = StateBlock(
+      subtype:BlockTypes.RECEIVE,
+      previous: previous,
+      representative: representative,
+      balance:balance,
+      link:link,
+      account: account,
+      privKey: privKey
+    );
+
+    BlockInfoItem previousInfo = await requestBlockInfo(previous);
+    StateBlock previousBlock = StateBlock.fromJson(json.decode(previousInfo.contents));
+
+    // Update data on our next pending request
+    receiveBlock.representative = previousBlock.representative;
+    receiveBlock.setBalance(previousBlock.balance);
+    await receiveBlock.sign(privKey);
+
+    // Process
+    ProcessRequest processRequest = ProcessRequest(
+      block: json.encode(receiveBlock.toJson()),
+      subType: BlockTypes.RECEIVE
+    );
+
+    return await requestProcess(processRequest);   
+  }
+
+  Future<ProcessResponse> requestSend(String representative, String previous, String sendAmount, String link, String account, String privKey, {bool max = false}) async {
+    StateBlock sendBlock = StateBlock(
+      subtype:BlockTypes.SEND,
+      previous: previous,
+      representative: representative,
+      balance: max ? "0" : sendAmount,
+      link:link,
+      account: account,
+      privKey: privKey
+    );
+
+    BlockInfoItem previousInfo = await requestBlockInfo(previous);
+    StateBlock previousBlock = StateBlock.fromJson(json.decode(previousInfo.contents));
+
+    // Update data on our next pending request
+    sendBlock.representative = previousBlock.representative;
+    sendBlock.setBalance(previousBlock.balance);
+    await sendBlock.sign(privKey);
+
+    // Process
+    ProcessRequest processRequest = ProcessRequest(
+      block: json.encode(sendBlock.toJson()),
+      subType: BlockTypes.SEND
+    );
+
+    return await requestProcess(processRequest);   
+  }
+
+  Future<ProcessResponse> requestOpen(String balance, String link, String account, String privKey, {String representative}) async {
+    representative = representative ?? await sl.get<SharedPrefsUtil>().getRepresentative();
+    StateBlock openBlock = StateBlock(
+      subtype:BlockTypes.OPEN,
+      previous: "0",
+      representative: representative,
+      balance:balance,
+      link:link,
+      account: account,
+      privKey: privKey
+    );
+
+    // Sign
+    await openBlock.sign(privKey);
+
+    // Process
+    ProcessRequest processRequest = ProcessRequest(
+      block: json.encode(openBlock.toJson()),
+      subType: BlockTypes.OPEN
+    );
+
+    return await requestProcess(processRequest);   
+  }
+
+  Future<ProcessResponse> requestChange(String account, String representative, String previous, String balance, String privKey) async {
+    StateBlock chgBlock = StateBlock(
+      subtype:BlockTypes.CHANGE,
+      previous: previous,
+      representative: representative,
+      balance: balance,
+      link:"0000000000000000000000000000000000000000000000000000000000000000",
+      account: account,
+      privKey: privKey
+    );
+
+    BlockInfoItem previousInfo = await requestBlockInfo(previous);
+    StateBlock previousBlock = StateBlock.fromJson(json.decode(previousInfo.contents));
+
+    // Update data on our next pending request
+    chgBlock.setBalance(previousBlock.balance);
+    await chgBlock.sign(privKey);
+
+    // Process
+    ProcessRequest processRequest = ProcessRequest(
+      block: json.encode(chgBlock.toJson()),
+      subType: BlockTypes.CHANGE
+    );
+
+    return await requestProcess(processRequest);   
+  }
 }
+

@@ -11,6 +11,7 @@ import 'package:event_taxi/event_taxi.dart';
 import 'package:logger/logger.dart';
 import 'package:manta_dart/manta_wallet.dart';
 import 'package:manta_dart/messages.dart';
+import 'package:natrium_wallet_flutter/model/db/account.dart';
 import 'package:natrium_wallet_flutter/ui/popup_button.dart';
 import 'package:natrium_wallet_flutter/appstate_container.dart';
 import 'package:natrium_wallet_flutter/dimens.dart';
@@ -27,7 +28,6 @@ import 'package:natrium_wallet_flutter/app_icons.dart';
 import 'package:natrium_wallet_flutter/ui/contacts/add_contact.dart';
 import 'package:natrium_wallet_flutter/ui/send/send_sheet.dart';
 import 'package:natrium_wallet_flutter/ui/send/send_confirm_sheet.dart';
-import 'package:natrium_wallet_flutter/ui/send/send_complete_sheet.dart';
 import 'package:natrium_wallet_flutter/ui/receive/receive_sheet.dart';
 import 'package:natrium_wallet_flutter/ui/settings/settings_drawer.dart';
 import 'package:natrium_wallet_flutter/ui/widgets/buttons.dart';
@@ -73,7 +73,7 @@ class _AppHomePageState extends State<AppHomePage>
   bool mantaAnimationOpen;
 
   // Receive card instance
-  AppReceiveSheet receive;
+  ReceiveSheet receive;
 
   // A separate unfortunate instance of this list, is a little unfortunate
   // but seems the only way to handle the animations
@@ -124,30 +124,28 @@ class _AppHomePageState extends State<AppHomePage>
     return true;
   }
 
-  /// Notification includes which account its for, automatically switch to it if they're entering app from notification
-  Future<void> _chooseCorrectAccountFromNotification(
-      Map<String, dynamic> message) async {
-    // TODO repair this method
-    return;
-    /*
-    try {
-      if (message.containsKey("account")) {
-        Account selectedAccount = await sl.get<DBHelper>().getSelectedAccount();
-        if (message['account'] != selectedAccount.address) {
-          List<Account> accounts = await sl.get<DBHelper>().getAccounts();
-          for (int i = 0; i < accounts.length; i++) {
-            if (accounts[i].address == message['account']) {
-              await sl.get<DBHelper>().changeAccount(accounts[i]);
-              EventTaxiImpl.singleton()
-                  .fire(AccountChangedEvent(account: accounts[i]));
-              break;
-            }
-          }
-        }
+  Future<void> _switchToAccount(String account) async {
+    List<Account> accounts = await sl
+        .get<DBHelper>()
+        .getAccounts(await StateContainer.of(context).getSeed());
+    for (Account a in accounts) {
+      if (a.address == account &&
+          a.address != StateContainer.of(context).wallet.address) {
+        await sl.get<DBHelper>().changeAccount(a);
+        EventTaxiImpl.singleton()
+            .fire(AccountChangedEvent(account: a, delayPop: true));
       }
-    } catch (e) {
-      log.severe(e.toString());
-    }*/
+    }
+  }
+
+  /// Notification includes which account its for, automatically switch to it if they're entering app from notification
+  Future<void> _chooseCorrectAccountFromNotification(dynamic message) async {
+    if (message.containsKey("account")) {
+      String account = message['account'];
+      if (account != null) {
+        await _switchToAccount(account);
+      }
+    }
   }
 
   @override
@@ -159,7 +157,7 @@ class _AppHomePageState extends State<AppHomePage>
     if (widget.priceConversion != null) {
       _priceConversion = widget.priceConversion;
     } else {
-      _priceConversion = PriceConversion.BTC;  
+      _priceConversion = PriceConversion.BTC;
     }
     // Main Card Size
     if (_priceConversion == PriceConversion.BTC) {
@@ -197,10 +195,14 @@ class _AppHomePageState extends State<AppHomePage>
         //print("onMessage: $message");
       },
       onLaunch: (Map<String, dynamic> message) async {
-        _chooseCorrectAccountFromNotification(message);
+        if (message.containsKey('data')) {
+          await _chooseCorrectAccountFromNotification(message['data']);
+        }
       },
       onResume: (Map<String, dynamic> message) async {
-        _chooseCorrectAccountFromNotification(message);
+        if (message.containsKey('data')) {
+          await _chooseCorrectAccountFromNotification(message['data']);
+        }
       },
     );
     _firebaseMessaging.requestNotificationPermissions(
@@ -303,7 +305,6 @@ class _AppHomePageState extends State<AppHomePage>
 
   StreamSubscription<HistoryHomeEvent> _historySub;
   StreamSubscription<ContactModifiedEvent> _contactModifiedSub;
-  StreamSubscription<SendCompleteEvent> _sendCompleteSub;
   StreamSubscription<DisableLockTimeoutEvent> _disableLockSub;
   StreamSubscription<AccountChangedEvent> _switchAccountSub;
 
@@ -318,31 +319,6 @@ class _AppHomePageState extends State<AppHomePage>
       if (StateContainer.of(context).initialDeepLink != null) {
         handleDeepLink(StateContainer.of(context).initialDeepLink);
         StateContainer.of(context).initialDeepLink = null;
-      }
-    });
-    _sendCompleteSub = EventTaxiImpl.singleton()
-        .registerTo<SendCompleteEvent>()
-        .listen((event) {
-      // Route to send complete if received process response for send block
-      if (event.previous != null) {
-        // Route to send complete
-        sl
-            .get<DBHelper>()
-            .getContactWithAddress(event.previous.link)
-            .then((contact) {
-          String contactName = contact == null ? null : contact.name;
-          Navigator.of(context).popUntil(RouteUtils.withNameLike('/home'));
-          Sheets.showAppHeightNineSheet(
-              context: context,
-              closeOnTap: true,
-              removeUntilHome: true,
-              widget: SendCompleteSheet(
-                  amountRaw: event.previous.sendAmount,
-                  destination: event.previous.link,
-                  contactName: contactName,
-                  localAmount: event.previous.localCurrencyValue,
-                  paymentRequest: event.previous.paymentRequest));
-        });
       }
     });
     _contactModifiedSub = EventTaxiImpl.singleton()
@@ -394,9 +370,6 @@ class _AppHomePageState extends State<AppHomePage>
     }
     if (_contactModifiedSub != null) {
       _contactModifiedSub.cancel();
-    }
-    if (_sendCompleteSub != null) {
-      _sendCompleteSub.cancel();
     }
     if (_disableLockSub != null) {
       _disableLockSub.cancel();
@@ -632,7 +605,9 @@ class _AppHomePageState extends State<AppHomePage>
       if (address.amount != null) {
         BigInt amountBigInt = BigInt.parse(address.amount);
         // Require minimum 1 rai to send, and make sure sufficient balance
-        if (amountBigInt != null && StateContainer.of(context).wallet.accountBalance > amountBigInt && amountBigInt >= BigInt.from(10).pow(24)) {
+        if (amountBigInt != null &&
+            StateContainer.of(context).wallet.accountBalance > amountBigInt &&
+            amountBigInt >= BigInt.from(10).pow(24)) {
           amount = address.amount;
         }
       }
@@ -701,8 +676,8 @@ class _AppHomePageState extends State<AppHomePage>
     );
     painter.toImageData(MediaQuery.of(context).size.width).then((byteData) {
       setState(() {
-        receive = AppReceiveSheet(
-          Container(
+        receive = ReceiveSheet(
+          qrWidget: Container(
               width: MediaQuery.of(context).size.width / 2.675,
               child: Image.memory(byteData.buffer.asUint8List())),
         );
@@ -858,7 +833,7 @@ class _AppHomePageState extends State<AppHomePage>
                             if (receive == null) {
                               return;
                             }
-                            receive.mainBottomSheet(context);
+                            Sheets.showAppHeightEightSheet(context: context, widget: receive);
                           },
                           highlightColor: receive != null
                               ? StateContainer.of(context).curTheme.background40
@@ -1436,7 +1411,7 @@ class _AppHomePageState extends State<AppHomePage>
           AnimatedContainer(
             duration: Duration(milliseconds: 200),
             curve: Curves.easeInOut,
-            width: 70.0,
+            width: 80.0,
             height: mainCardHeight,
             alignment: AlignmentDirectional(-1, -1),
             child: AnimatedContainer(
@@ -1466,11 +1441,25 @@ class _AppHomePageState extends State<AppHomePage>
             curve: Curves.easeInOut,
             child: _getBalanceWidget(),
           ),
+          // Nnnnn
           AnimatedContainer(
             duration: Duration(milliseconds: 200),
             curve: Curves.easeInOut,
-            width: 70.0,
+            width: 80.0,
             height: mainCardHeight,
+            alignment: Alignment(0, 0),
+            /* child: Container(
+              width: 70.0,
+              height: 70.0,
+              margin: EdgeInsetsDirectional.fromSTEB(0, 6, 10, 4),
+              child: SvgPicture.network(
+                'https://natricon-go-server.appditto.com/api/svg?address=' +
+                    StateContainer.of(context).wallet.address,
+                placeholderBuilder: (BuildContext context) => Container(
+                    padding: const EdgeInsets.all(10.0),
+                    child: const CircularProgressIndicator()),
+              ),
+            ), */
           ),
         ],
       ),
@@ -1604,6 +1593,7 @@ class _AppHomePageState extends State<AppHomePage>
         ),
       );
     }
+    // Balance texts
     return GestureDetector(
       onTap: () {
         if (_priceConversion == PriceConversion.BTC) {
@@ -1638,7 +1628,7 @@ class _AppHomePageState extends State<AppHomePage>
       },
       child: Container(
         alignment: Alignment.center,
-        width: MediaQuery.of(context).size.width - 185,
+        width: MediaQuery.of(context).size.width - 190,
         color: Colors.transparent,
         child: _priceConversion == PriceConversion.HIDDEN
             ?
